@@ -1705,15 +1705,15 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
             case 0:
             case 1:
                 if (actual_type != SQLITE_TEXT)
-                    return sqlite_vtab_set_error(&vtab->base, "%s: argument %d must be of type TEXT (got %s).", fname, (i+1), argc, sqlite_type_name(actual_type));
+                    return sqlite_vtab_set_error(&vtab->base, "%s: argument %d must be of type TEXT (got %s).", fname, (i+1), sqlite_type_name(actual_type));
                 break;
             case 2:
                 if ((actual_type != SQLITE_TEXT) && (actual_type != SQLITE_BLOB))
-                    return sqlite_vtab_set_error(&vtab->base, "%s: argument %d must be of type TEXT or BLOB (got %s).", fname, (i+1), argc, sqlite_type_name(actual_type));
+                    return sqlite_vtab_set_error(&vtab->base, "%s: argument %d must be of type TEXT or BLOB (got %s).", fname, (i+1), sqlite_type_name(actual_type));
                 break;
             case 3:
                 if (actual_type != SQLITE_INTEGER)
-                    return sqlite_vtab_set_error(&vtab->base, "%s: argument %d must be of type INTEGER (got %s).", fname, (i+1), argc, sqlite_type_name(actual_type));
+                    return sqlite_vtab_set_error(&vtab->base, "%s: argument %d must be of type INTEGER (got %s).", fname, (i+1), sqlite_type_name(actual_type));
                 break;
         }
     }
@@ -1748,32 +1748,52 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
         }
     }
     
+    // requested top-K (as passed by the caller)
     int k = sqlite3_value_int(argv[3]);
     
     // nothing needs to be returned
     if (k == 0) return SQLITE_DONE;
     
-    if (c->row_count != k) {
+    // oversample candidate pool to mitigate starvation after outer filters (e.g., JOIN/WHERE)
+    // choose a conservative factor with caps; prefer small pools for tiny k, smaller factor for large k
+    int pool = k;
+    if (pool > 0) {
+        if (pool < 128) pool = pool * 16;
+        else if (pool < 1024) pool = pool * 8;
+        else pool = pool * 4;
+    }
+    // if we have preloaded quantization, cap to available entries
+    if (t_ctx->preloaded && (pool > t_ctx->precounter)) pool = t_ctx->precounter;
+    if (pool < k) pool = k; // never less than requested
+    
+    // (re)allocate working buffers sized to the pool
+    if (c->row_count != pool) {
         if (c->rowids) sqlite3_free(c->rowids);
-        c->rowids = (int64_t *)sqlite3_malloc(k * sizeof(int64_t));
+        c->rowids = (int64_t *)sqlite3_malloc(pool * sizeof(int64_t));
         if (c->rowids == NULL) return SQLITE_NOMEM;
         
         if (c->distance) sqlite3_free(c->distance);
-        c->distance = (double *)sqlite3_malloc(k * sizeof(double));
+        c->distance = (double *)sqlite3_malloc(pool * sizeof(double));
         if (c->distance == NULL) return SQLITE_NOMEM;
     }
     
-    memset(c->rowids, 0, k * sizeof(int64_t));
-    for (int i=0; i<k; ++i) c->distance[i] = INFINITY;
+    memset(c->rowids, 0, pool * sizeof(int64_t));
+    for (int i=0; i<pool; ++i) c->distance[i] = INFINITY;
     
     c->size = 0;
     c->table = t_ctx;
     c->row_index = 0;
-    c->row_count = k;
+    c->row_count = pool;        // IMPORTANT: emit the whole pool (not just k)
+    c->max_index = 0;           // implicit from memset in open, but set explicitly
     
     int rc = run_callback(vtab->db, c, vector, vsize);
-    int count = sort_callback(c);
-    c->row_count -= count;
+    
+    // sort by distance and drop empty slots (INFINITY)
+    int dropped = sort_callback(c);
+    c->row_count -= dropped;
+    
+    // NOTE: do NOT cap to 'k' here. We intentionally expose an oversampled set so that
+    //       outer SQL filters (e.g., WHERE type=...) can still yield 'k' rows overall.
     
     #if 0
     for (int i=0; i<c->row_count; ++i) {
