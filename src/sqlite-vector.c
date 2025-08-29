@@ -10,6 +10,7 @@
 #include "distance-cpu.h"
 
 #include <math.h>
+#include <float.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <limits.h>
@@ -51,6 +52,13 @@ SQLITE_EXTENSION_INIT1
 #define DEBUG_VECTOR(...)                           do {printf(__VA_ARGS__ );printf("\n");} while (0)
 #else
 #define DEBUG_VECTOR(...)
+#endif
+
+#define DEBUG_VECTOR_SERIALIZATION                  0
+#if DEBUG_VECTOR_SERIALIZATION
+#define VECTOR_PRINT(_b,_t,_n)                      vector_print(_b,_t,_n)
+#else
+#define VECTOR_PRINT(_b,_t,_n)
 #endif
 
 #define SKIP_SPACES(_p)                             while (*(_p) && isspace((unsigned char)*(_p))) (_p)++
@@ -451,9 +459,31 @@ cleanup:
     return rc;
 }
 
-// MARK: - General Utils -
+// MARK: - Quantization -
 
-static inline void quantize_float32_to_unsigned8bit (float *v, uint8_t *q, float offset, float scale, int n) {
+static inline uint8_t q_round_u8 (float s) {
+    if (!isfinite(s)) {
+        return (s > 0.0f) ? 255u : 0u;   /* NaN -> 0, +Inf -> 255, -Inf -> 0 */
+    }
+    float r = s + 0.5f * (1.0f - 2.0f * (s < 0.0f));  /* half away from zero */
+    if (r >= 255.0f) return 255u;
+    if (r <= 0.0f)   return 0u;
+    int ir = (int)r;                      /* safe after the clamp above */
+    return (uint8_t)ir;
+}
+
+static inline int8_t q_round_s8 (float s) {
+    if (!isfinite(s)) {
+        return (s > 0.0f) ? 127 : (s < 0.0f ? -128 : 0);
+    }
+    /* half-away-from-zero */
+    float r = s + 0.5f * (1.0f - 2.0f * (s < 0.0f));
+    if (r >= 127.0f)  return 127;
+    if (r <= -128.0f) return -128;
+    return (int8_t)(int)r;
+}
+
+static inline void quantize_float32_to_unsigned8bit (const float *v, uint8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
         float s0 = (v[i]     - offset) * scale;
@@ -486,7 +516,83 @@ static inline void quantize_float32_to_unsigned8bit (float *v, uint8_t *q, float
     }
 }
 
-static inline void quantize_float32_to_signed8bit (float *v, int8_t *q, float offset, float scale, int n) {
+static inline void quantize_float16_to_unsigned8bit (const uint16_t *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = float16_to_float32(v[i    ]);
+        float x1 = float16_to_float32(v[i + 1]);
+        float x2 = float16_to_float32(v[i + 2]);
+        float x3 = float16_to_float32(v[i + 3]);
+
+        q[i    ] = q_round_u8((x0 - offset) * scale);
+        q[i + 1] = q_round_u8((x1 - offset) * scale);
+        q[i + 2] = q_round_u8((x2 - offset) * scale);
+        q[i + 3] = q_round_u8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = float16_to_float32(v[i]);
+        q[i] = q_round_u8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_bfloat16_to_unsigned8bit (const uint16_t *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = bfloat16_to_float32(v[i    ]);
+        float x1 = bfloat16_to_float32(v[i + 1]);
+        float x2 = bfloat16_to_float32(v[i + 2]);
+        float x3 = bfloat16_to_float32(v[i + 3]);
+
+        q[i    ] = q_round_u8((x0 - offset) * scale);
+        q[i + 1] = q_round_u8((x1 - offset) * scale);
+        q[i + 2] = q_round_u8((x2 - offset) * scale);
+        q[i + 3] = q_round_u8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = bfloat16_to_float32(v[i]);
+        q[i] = q_round_u8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_u8_to_unsigned8bit (const uint8_t *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = (float)v[i    ];
+        float x1 = (float)v[i + 1];
+        float x2 = (float)v[i + 2];
+        float x3 = (float)v[i + 3];
+
+        q[i    ] = q_round_u8((x0 - offset) * scale);
+        q[i + 1] = q_round_u8((x1 - offset) * scale);
+        q[i + 2] = q_round_u8((x2 - offset) * scale);
+        q[i + 3] = q_round_u8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = (float)v[i];
+        q[i] = q_round_u8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_i8_to_unsigned8bit (const int8_t *v, uint8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = (float)v[i    ];
+        float x1 = (float)v[i + 1];
+        float x2 = (float)v[i + 2];
+        float x3 = (float)v[i + 3];
+
+        q[i    ] = q_round_u8((x0 - offset) * scale);
+        q[i + 1] = q_round_u8((x1 - offset) * scale);
+        q[i + 2] = q_round_u8((x2 - offset) * scale);
+        q[i + 3] = q_round_u8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = (float)v[i];
+        q[i] = q_round_u8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_float32_to_signed8bit (const float *v, int8_t *q, float offset, float scale, int n) {
     int i = 0;
     for (; i + 3 < n; i += 4) {
         float s0 = (v[i]     - offset) * scale;
@@ -517,6 +623,109 @@ static inline void quantize_float32_to_signed8bit (float *v, int8_t *q, float of
         q[i] = (int8_t)rounded;
     }
 }
+
+static inline void quantize_float16_to_signed8bit (const uint16_t *v, int8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = float16_to_float32(v[i    ]);
+        float x1 = float16_to_float32(v[i + 1]);
+        float x2 = float16_to_float32(v[i + 2]);
+        float x3 = float16_to_float32(v[i + 3]);
+
+        q[i    ] = q_round_s8((x0 - offset) * scale);
+        q[i + 1] = q_round_s8((x1 - offset) * scale);
+        q[i + 2] = q_round_s8((x2 - offset) * scale);
+        q[i + 3] = q_round_s8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = float16_to_float32(v[i]);
+        q[i] = q_round_s8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_bfloat16_to_signed8bit (const uint16_t *v, int8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = bfloat16_to_float32(v[i    ]);
+        float x1 = bfloat16_to_float32(v[i + 1]);
+        float x2 = bfloat16_to_float32(v[i + 2]);
+        float x3 = bfloat16_to_float32(v[i + 3]);
+
+        q[i    ] = q_round_s8((x0 - offset) * scale);
+        q[i + 1] = q_round_s8((x1 - offset) * scale);
+        q[i + 2] = q_round_s8((x2 - offset) * scale);
+        q[i + 3] = q_round_s8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = bfloat16_to_float32(v[i]);
+        q[i] = q_round_s8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_u8_to_signed8bit (const uint8_t *v, int8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = (float)v[i    ];
+        float x1 = (float)v[i + 1];
+        float x2 = (float)v[i + 2];
+        float x3 = (float)v[i + 3];
+
+        q[i    ] = q_round_s8((x0 - offset) * scale);
+        q[i + 1] = q_round_s8((x1 - offset) * scale);
+        q[i + 2] = q_round_s8((x2 - offset) * scale);
+        q[i + 3] = q_round_s8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = (float)v[i];
+        q[i] = q_round_s8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_i8_to_signed8bit (const int8_t *v, int8_t *q, float offset, float scale, int n) {
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float x0 = (float)v[i    ];
+        float x1 = (float)v[i + 1];
+        float x2 = (float)v[i + 2];
+        float x3 = (float)v[i + 3];
+
+        q[i    ] = q_round_s8((x0 - offset) * scale);
+        q[i + 1] = q_round_s8((x1 - offset) * scale);
+        q[i + 2] = q_round_s8((x2 - offset) * scale);
+        q[i + 3] = q_round_s8((x3 - offset) * scale);
+    }
+    for (; i < n; ++i) {
+        float x = (float)v[i];
+        q[i] = q_round_s8((x - offset) * scale);
+    }
+}
+
+static inline void quantize_float32 (const float *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_float32_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_float32_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+static inline void quantize_float16 (const uint16_t *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_float16_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_float16_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+static inline void quantize_bfloat16 (const uint16_t *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_bfloat16_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_bfloat16_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+static inline void quantize_u8 (const uint8_t *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_u8_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_u8_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+static inline void quantize_i8 (const int8_t *v, uint8_t *q, float offset, float scale, int dim, vector_qtype qtype) {
+    if (qtype == VECTOR_QUANT_U8BIT) quantize_i8_to_unsigned8bit(v, q, offset, scale, dim);
+    else quantize_i8_to_signed8bit(v, (int8_t *)q, offset, scale, dim);
+}
+
+// MARK: - General Utils -
 
 static size_t vector_type_to_size (vector_type type) {
     switch (type) {
@@ -570,13 +779,53 @@ static vector_distance distance_name_to_type (const char *dname) {
 const char *vector_distance_to_name (vector_distance type) {
     switch (type) {
         case VECTOR_DISTANCE_L2: return "L2";
-        case VECTOR_DISTANCE_SQUARED_L2: return "L2 SQUARED";
+        case VECTOR_DISTANCE_SQUARED_L2: return "SQUARED_L2";
         case VECTOR_DISTANCE_COSINE: return "COSINE";
         case VECTOR_DISTANCE_DOT: return "DOT";
         case VECTOR_DISTANCE_L1: return "L1";
     }
     return "N/A";
 }
+
+#if DEBUG_VECTOR_SERIALIZATION
+static void vector_print (void *buf, vector_type type, int n) {
+    printf("type: %s - dim: %d [", vector_type_to_name(type), n);
+    for (int i=0; i<n; ++i) {
+        switch (type) {
+            case VECTOR_TYPE_F32: {
+                float *f = (float *)buf;
+                printf("%f,", f[i]);
+            }
+            break;
+                
+            case VECTOR_TYPE_F16: {
+                uint16_t *f = (uint16_t *)buf;
+                printf("%f,", float16_to_float32(f[i]));
+            }
+            break;
+                
+            case VECTOR_TYPE_BF16: {
+                uint16_t *f = (uint16_t *)buf;
+                printf("%f,", bfloat16_to_float32(f[i]));
+            }
+            break;
+                
+            case VECTOR_TYPE_U8: {
+                uint8_t *u = (uint8_t *)buf;
+                printf("%d,", u[i]);
+            }
+            break;
+                
+            case VECTOR_TYPE_I8: {
+                int8_t *u = (int8_t *)buf;
+                printf("%d,", u[i]);
+            }
+            break;
+        }
+    }
+    printf("]\n");
+}
+#endif
 
 static bool sanity_check_args (sqlite3_context *context, const char *func_name, int argc, sqlite3_value **argv, int ntypes, int *types) {
     if (argc != ntypes) {
@@ -711,6 +960,10 @@ bool vector_keyvalue_callback (sqlite3_context *context, void *xdata, const char
     return true;
 }
 
+static inline int nearly_zero_float32 (float x) {
+    return fabsf(x) <= 8.0f * FLT_EPSILON;  // tweak factor for your use
+}
+
 // MARK: - SQL -
 
 static char *generate_create_quant_table (const char *table_name, const char *column_name, char sql[STATIC_SQL_SIZE]) {
@@ -765,6 +1018,8 @@ void vector_context_free (void *p) {
 }
 
 table_context *vector_context_lookup (vector_context *ctx, const char *table_name, const char *column_name) {
+    if ((table_name == NULL) || (column_name == NULL)) return NULL;
+    
     for (int i=0; i<ctx->table_count; ++i) {
         // tname and cname can be NULL after adding vector_cleanup function
         const char *tname = ctx->tables[i].t_name;
@@ -858,12 +1113,13 @@ vector_serialize_quantization_cleanup:
     return rc;
 }
 
-static int vector_rebuild_quantization (sqlite3_context *context, const char *table_name, const char *column_name, table_context *t_ctx, vector_qtype qtype, uint64_t max_memory) {
+static int vector_rebuild_quantization (sqlite3_context *context, const char *table_name, const char *column_name, table_context *t_ctx, vector_qtype qtype, uint64_t max_memory, uint32_t *count) {
     
     int rc = SQLITE_NOMEM;
     sqlite3_stmt *vm = NULL;
     char sql[STATIC_SQL_SIZE];
     sqlite3 *db = sqlite3_context_db_handle(context);
+    uint32_t tot_processed = 0;
     
     const char *pk_name = t_ctx->pk_name;
     int dim = t_ctx->options.v_dim;
@@ -871,25 +1127,37 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     float *tempv = NULL;
     
     // compute size of a single quant, format is: rowid + quantize dimensions
-    int q_size = sizeof(int64_t) + (dim * sizeof(uint8_t));
+    size_t q_size = sizeof(int64_t) + (size_t)dim * sizeof(uint8_t);
+    if (q_size == 0) {
+        sqlite3_result_error(context, "Vector dimension is zero, which is not possible.", -1);
+        return SQLITE_MISUSE;
+    }
     
     // max_memory == 0 means use all required memory
     if (max_memory == 0) {
-        char sql[STATIC_SQL_SIZE];
         sqlite3_snprintf(sizeof(sql), sql, "SELECT COUNT(*) FROM %q;", table_name);
-        
         int64_t count = sqlite_read_int64(db, sql);
-        max_memory = (count == 0) ? DEFAULT_MAX_MEMORY : (uint64_t)(count * q_size);
+        max_memory = (count == 0) ? DEFAULT_MAX_MEMORY : (uint64_t)count * (uint64_t)q_size;
+        if (count <= 0) {
+            // no vectors
+            t_ctx->options.q_type = (qtype == VECTOR_QUANT_AUTO) ? VECTOR_QUANT_U8BIT : qtype;
+            t_ctx->scale = 1.0f;
+            t_ctx->offset = 0.0f;
+            return SQLITE_OK;
+        }
     }
     
-    // max number of vectors that fits in max_memory
-    uint32_t max_vectors = (uint32_t)(max_memory / q_size);
+    // max number of vectors that fits in max_memory (per batch; force at least 1)
+    uint32_t max_vectors = (uint32_t)(max_memory / (uint64_t)q_size);
+    if (max_vectors == 0) max_vectors = 1;
     
-    uint8_t *data = sqlite3_malloc64((sqlite3_uint64)(max_vectors * q_size));
+    sqlite3_uint64 out_bytes = (sqlite3_uint64)max_vectors * (sqlite3_uint64)q_size;
+    uint8_t *data = sqlite3_malloc64(out_bytes);
     uint8_t *original = data;
     if (!data) goto vector_rebuild_quantization_cleanup;
     
-    tempv = (float *)sqlite3_malloc(sizeof(float) * dim);
+    sqlite3_uint64 temp_bytes = (sqlite3_uint64)dim * (sqlite3_uint64)sizeof(float);
+    tempv = (float *)sqlite3_malloc64(temp_bytes);
     if (!tempv) goto vector_rebuild_quantization_cleanup;
         
     // SELECT rowid, embedding FROM table
@@ -906,17 +1174,21 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     float min_val = MAXFLOAT;
     float max_val = -MAXFLOAT;
     #endif
-    
     bool contains_negative = false;
+    
     while (1) {
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
         else if (rc != SQLITE_ROW) break;
+        if (sqlite3_column_type(vm, 1) == SQLITE_NULL) continue;
         
         const void *blob = (float *)sqlite3_column_blob(vm, 1);
+        if (!blob) continue;
+        
         int blob_size = sqlite3_column_bytes(vm, 1);
-        if (!blob || blob_size < dim * vector_type_to_size(type)) {
-            context_result_error(context, SQLITE_ERROR, "Invalid or missing vector blob found at rowid %lld.", (long long)sqlite3_column_int64(vm, 0));
+        size_t need_bytes = (size_t)dim * (size_t)vector_type_to_size(type);
+        if (blob_size < need_bytes) {
+            context_result_error(context, SQLITE_ERROR, "Invalid vector blob found at rowid %lld.", (long long)sqlite3_column_int64(vm, 0));
             rc = SQLITE_ERROR;
             goto vector_rebuild_quantization_cleanup;
         }
@@ -928,7 +1200,7 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
                     val = ((float *)blob)[i];
                     break;
                 case VECTOR_TYPE_F16:
-                    val = fp16_ieee_to_fp32_value(((uint16_t *)blob)[i]);
+                    val = float16_to_float32(((uint16_t *)blob)[i]);
                     break;
                 case VECTOR_TYPE_BF16:
                     val = bfloat16_to_float32(((uint16_t *)blob)[i]);
@@ -974,50 +1246,35 @@ static int vector_rebuild_quantization (sqlite3_context *context, const char *ta
     // STEP 3
     // actual quantization (ONLY 8bit is supported in this version)
     uint32_t n_processed = 0;
-    uint32_t tot_processed = 0;
     int64_t min_rowid = 0, max_rowid = 0;
     while (1) {
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; break;}
         else if (rc != SQLITE_ROW) break;
+        if (sqlite3_column_type(vm, 1) == SQLITE_NULL) continue;
         
         int64_t rowid = (int64_t)sqlite3_column_int64(vm, 0);
         const void *blob = sqlite3_column_blob(vm, 1);
-        if (n_processed == 0) min_rowid = rowid;
+        if (!blob) continue;
         
-        float *v = tempv;
-        if (type == VECTOR_TYPE_F32) {
-            v = (float *)blob;
-        } else {
-            for (int i = 0; i < dim; ++i) {
-                switch (type) {
-                    case VECTOR_TYPE_F32:
-                        break;
-                    case VECTOR_TYPE_F16:
-                        v[i] = fp16_ieee_to_fp32_value(((uint16_t *)blob)[i]);
-                        break;
-                    case VECTOR_TYPE_BF16:
-                        v[i] = bfloat16_to_float32(((uint16_t *)blob)[i]);
-                        break;
-                    case VECTOR_TYPE_U8:
-                        v[i] = (float)(((uint8_t *)blob)[i]);
-                        break;
-                    case VECTOR_TYPE_I8:
-                        v[i] = (float)(((int8_t *)blob)[i]);
-                        break;
-                }
-            }
-        }
+        if (n_processed == 0) min_rowid = rowid;
+        VECTOR_PRINT((void *)blob, type, dim);
         
         // copy rowid
         INT64_TO_INT8PTR(rowid, data);
         data += sizeof(int64_t);
         
         // quantize vector
-        if (qtype == VECTOR_QUANT_U8BIT) quantize_float32_to_unsigned8bit(v, data, offset, scale, dim);
-        else quantize_float32_to_signed8bit(v, (int8_t *)data, offset, scale, dim);
-        data += (dim * sizeof(uint8_t));
+        switch (type) {
+            case VECTOR_TYPE_F32: quantize_float32((const float *)blob, data, offset, scale, dim, qtype); break;
+            case VECTOR_TYPE_F16: quantize_float16((const uint16_t *)blob, data, offset, scale, dim, qtype); break;
+            case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)blob, data, offset, scale, dim, qtype); break;
+            case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)blob, data, offset, scale, dim, qtype); break;
+            case VECTOR_TYPE_I8: quantize_i8((const int8_t *)blob, data, offset, scale, dim, qtype); break;
+        }
+        VECTOR_PRINT((void *)data, (qtype == VECTOR_QUANT_U8BIT) ? VECTOR_TYPE_U8 : VECTOR_TYPE_I8, dim);
         
+        data += (dim * sizeof(uint8_t));
         max_rowid = rowid;
         ++n_processed;
         ++tot_processed;
@@ -1042,90 +1299,8 @@ vector_rebuild_quantization_cleanup:
     if (original) sqlite3_free(original);
     if (tempv) sqlite3_free(tempv);
     if (vm) sqlite3_finalize(vm);
+    if (count) *count = tot_processed;
     return rc;
-}
-
-static void vector_quantize (sqlite3_context *context, const char *table_name, const char *column_name, const char *arg_options) {
-    table_context *t_ctx = vector_context_lookup((vector_context *)sqlite3_user_data(context), table_name, column_name);
-    if (!t_ctx) {
-        context_result_error(context, SQLITE_ERROR, "Vector context not found for table '%s' and column '%s'. Ensure that vector_init() has been called before using vector_quantize().", table_name, column_name);
-        return;
-    }
-    
-    int rc = SQLITE_ERROR;
-    char sql[STATIC_SQL_SIZE];
-    sqlite3 *db = sqlite3_context_db_handle(context);
-    
-    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    generate_drop_quant_table(table_name, column_name, sql);
-    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    generate_create_quant_table(table_name, column_name, sql);
-    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    vector_options options = vector_options_create();
-    bool res = parse_keyvalue_string(context, arg_options, vector_keyvalue_callback, &options);
-    if (res == false) return;
-    
-    rc = vector_rebuild_quantization(context, table_name, column_name, t_ctx, options.q_type, options.max_memory);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-    // serialize quantization options
-    rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_QUANTTYPE, t_ctx->options.q_type, 0);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTSCALE, 0, t_ctx->scale);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTOFFSET, 0, t_ctx->offset);
-    if (rc != SQLITE_OK) goto quantize_cleanup;
-    
-quantize_cleanup:
-    if (rc != SQLITE_OK) {
-        printf("%s", sqlite3_errmsg(db));
-        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
-        sqlite3_result_error_code(context, rc);
-        return;
-    }
-}
-
-static void vector_quantize3 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    int types[] = {SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT};
-    if (sanity_check_args(context, "vector_quantize", argc, argv, 3, types) == false) return;
-    
-    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
-    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
-    const char *options = (const char *)sqlite3_value_text(argv[2]);
-    vector_quantize(context, table_name, column_name, options);
-}
-
-static void vector_quantize2 (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
-    if (sanity_check_args(context, "vector_quantize", argc, argv, 2, types) == false) return;
-    
-    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
-    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
-    vector_quantize(context, table_name, column_name, NULL);
-}
-
-static void vector_quantize_memory (sqlite3_context *context, int argc, sqlite3_value **argv) {
-    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
-    if (sanity_check_args(context, "vector_quantize_memory", argc, argv, 2, types) == false) return;
-    
-    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
-    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
-    
-    char sql[STATIC_SQL_SIZE];
-    generate_memory_quant_table(table_name, column_name, sql);
-    
-    sqlite3 *db = sqlite3_context_db_handle(context);
-    sqlite3_int64 memory = sqlite_read_int64(db, sql);
-    sqlite3_result_int64(context, memory);
 }
 
 static void vector_quantize_preload (sqlite3_context *context, int argc, sqlite3_value **argv) {
@@ -1196,9 +1371,104 @@ vector_preload_cleanup:
     return;
 }
 
-static void vector_cleanup (sqlite3_context *context, int argc, sqlite3_value **argv) {
+static int vector_quantize (sqlite3_context *context, const char *table_name, const char *column_name, const char *arg_options, bool *was_preloaded) {
+    table_context *t_ctx = vector_context_lookup((vector_context *)sqlite3_user_data(context), table_name, column_name);
+    if (!t_ctx) {
+        context_result_error(context, SQLITE_ERROR, "Vector context not found for table '%s' and column '%s'. Ensure that vector_init() has been called before using vector_quantize().", table_name, column_name);
+        return SQLITE_ERROR;
+    }
+    
+    uint32_t counter = 0;
+    int rc = SQLITE_ERROR;
+    char sql[STATIC_SQL_SIZE];
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    
+    rc = sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    generate_drop_quant_table(table_name, column_name, sql);
+    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    generate_create_quant_table(table_name, column_name, sql);
+    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    vector_options options = vector_options_create();
+    bool res = parse_keyvalue_string(context, arg_options, vector_keyvalue_callback, &options);
+    if (res == false) return SQLITE_ERROR;
+    
+    rc = vector_rebuild_quantization(context, table_name, column_name, t_ctx, options.q_type, options.max_memory, &counter);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    rc = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+    // serialize quantization options
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_INTEGER, OPTION_KEY_QUANTTYPE, t_ctx->options.q_type, 0);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTSCALE, 0, t_ctx->scale);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    rc = sqlite_serialize(context, table_name, column_name, SQLITE_FLOAT, OPTION_KEY_QUANTOFFSET, 0, t_ctx->offset);
+    if (rc != SQLITE_OK) goto quantize_cleanup;
+    
+quantize_cleanup:
+    if (rc != SQLITE_OK) {
+        printf("%s", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        sqlite3_result_error_code(context, rc);
+        return rc;
+    }
+    
+    // returns the total number of quantized rows
+    sqlite3_result_int64(context, (sqlite3_int64)counter);
+    if (was_preloaded) *was_preloaded = (t_ctx->preloaded != NULL);
+    return SQLITE_OK;
+}
+
+static void vector_quantize3 (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_quantize", argc, argv, 3, types) == false) return;
+    
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+    const char *options = (const char *)sqlite3_value_text(argv[2]);
+    
+    bool was_preloaded = false;
+    int rc = vector_quantize(context, table_name, column_name, options, &was_preloaded);
+    if ((rc == SQLITE_OK) && (was_preloaded)) vector_quantize_preload(context, argc, argv);
+}
+
+static void vector_quantize2 (sqlite3_context *context, int argc, sqlite3_value **argv) {
     int types[] = {SQLITE_TEXT, SQLITE_TEXT};
-    if (sanity_check_args(context, "vector_cleanup", argc, argv, 2, types) == false) return;
+    if (sanity_check_args(context, "vector_quantize", argc, argv, 2, types) == false) return;
+    
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+    
+    bool was_preloaded = false;
+    int rc = vector_quantize(context, table_name, column_name, NULL, &was_preloaded);
+    if ((rc == SQLITE_OK) && (was_preloaded)) vector_quantize_preload(context, argc, argv);
+}
+
+static void vector_quantize_memory (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_quantize_memory", argc, argv, 2, types) == false) return;
+    
+    const char *table_name = (const char *)sqlite3_value_text(argv[0]);
+    const char *column_name = (const char *)sqlite3_value_text(argv[1]);
+    
+    char sql[STATIC_SQL_SIZE];
+    generate_memory_quant_table(table_name, column_name, sql);
+    
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    sqlite3_int64 memory = sqlite_read_int64(db, sql);
+    sqlite3_result_int64(context, memory);
+}
+
+static void vector_quantize_cleanup (sqlite3_context *context, int argc, sqlite3_value **argv) {
+    int types[] = {SQLITE_TEXT, SQLITE_TEXT};
+    if (sanity_check_args(context, "vector_quantize_cleanup", argc, argv, 2, types) == false) return;
     
     const char *table_name = (const char *)sqlite3_value_text(argv[0]);
     const char *column_name = (const char *)sqlite3_value_text(argv[1]);
@@ -1207,20 +1477,18 @@ static void vector_cleanup (sqlite3_context *context, int argc, sqlite3_value **
     table_context *t_ctx = vector_context_lookup(v_ctx, table_name, column_name);
     if (!t_ctx) return; // if no table context exists then do nothing
     
-    // release memory
-    if (t_ctx->t_name) sqlite3_free(t_ctx->t_name);
-    if (t_ctx->c_name) sqlite3_free(t_ctx->c_name);
-    if (t_ctx->pk_name) sqlite3_free(t_ctx->pk_name);
-    if (t_ctx->preloaded) sqlite3_free(t_ctx->preloaded);
-    memset(t_ctx, 0, sizeof(table_context));
+    // release any memory used in quantization
+    if (t_ctx->preloaded) {
+        sqlite3_free(t_ctx->preloaded);
+        t_ctx->preloaded = NULL;
+        t_ctx->precounter = 0;
+    }
     
     // drop quant table (if any)
     char sql[STATIC_SQL_SIZE];
     sqlite3 *db = sqlite3_context_db_handle(context);
     generate_drop_quant_table(table_name, column_name, sql);
     sqlite3_exec(db, sql, NULL, NULL, NULL);
-    
-    // do not decrease v_ctx->table_count
 }
 
 // MARK: -
@@ -1389,6 +1657,8 @@ static void vector_as_type (sqlite3_context *context, vector_type type, int argc
         char *blob = vector_from_json(context, NULL, type, json, &value_size, dimension);
         if (!blob) return; // error is set in the context
         
+        VECTOR_PRINT((void *)blob, type, (dimension == 0) ? (value_size / vector_type_to_size(type)) : dimension);
+        
         sqlite3_result_blob(context, (const void *)blob, value_size, sqlite3_free);
         return;
     }
@@ -1465,13 +1735,15 @@ static int vCursorFilterCommon (sqlite3_vtab_cursor *cur, int idxNum, const char
     } else {
         vector = (const void *)sqlite3_value_blob(argv[2]);
         vsize = sqlite3_value_bytes(argv[2]);
+        if (!vector) return sqlite_vtab_set_error(&vtab->base, "%s: input vector cannot be NULL.", fname);
     }
+    VECTOR_PRINT((void*)vector, t_ctx->options.v_type, t_ctx->options.v_dim);
     
     if (check_quant) {
         char buffer[STATIC_SQL_SIZE];
         char *name = generate_quant_table_name(table_name, column_name, buffer);
         if (!name || !sqlite_table_exists(vtab->db, name)) {
-            sqlite_vtab_set_error(&vtab->base, "Quantization table not found for table '%s' and column '%s'. Ensure that vector_quantize() has been called before using vector_quantize_scan().");
+            sqlite_vtab_set_error(&vtab->base, "Quantization table not found for table '%s' and column '%s'. Ensure that vector_quantize() has been called before using vector_quantize_scan().", table_name, column_name);
             return SQLITE_ERROR;
         }
     }
@@ -1681,9 +1953,14 @@ static int vFullScanRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1
         rc = sqlite3_step(vm);
         if (rc == SQLITE_DONE) {rc = SQLITE_OK; goto cleanup;}
         if (rc != SQLITE_ROW) goto cleanup;
+        if (sqlite3_column_type(vm, 1) == SQLITE_NULL) continue;
         
         float *v2 = (float *)sqlite3_column_blob(vm, 1);
-        double distance = distance_fn((const void *)v1, (const void *)v2, dimension);
+        if (v2 == NULL) continue;
+        
+        float distance = distance_fn((const void *)v1, (const void *)v2, dimension);
+        if (nearly_zero_float32(distance)) distance = 0.0;
+        VECTOR_PRINT((void*)v2, vt, dimension);
         
         if (distance < c->distance[c->max_index]) {
             c->distance[c->max_index] = distance;
@@ -1726,7 +2003,8 @@ static int vQuantRunMemory(vFullScanCursor *c, uint8_t *v, vector_qtype qtype, i
         const uint8_t *vector_data = current_data + rowid_size;
 
         float dist = distance_fn((const void *)v, (const void *)vector_data, dim);
-
+        if (nearly_zero_float32(dist)) dist = 0.0;
+        
         if (dist < current_max) {
             distance[max_index] = dist;
             rowids[max_index] = INT64_FROM_INT8PTR(current_data);
@@ -1747,17 +2025,26 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
     uint8_t *v = (uint8_t *)sqlite3_malloc(dimension * sizeof(int8_t));
     if (!v) return SQLITE_NOMEM;
     
+    // quantize vector
     vector_qtype qtype = c->table->options.q_type;
-    if (qtype == VECTOR_QUANT_U8BIT) {
-        quantize_float32_to_unsigned8bit((float *)v1, v, c->table->offset, c->table->scale, dimension);
-    } else {
-        quantize_float32_to_signed8bit((float *)v1, (int8_t *)v, c->table->offset, c->table->scale, dimension);
+    float offset = c->table->offset;
+    float scale = c->table->scale;
+    vector_type type = c->table->options.v_type;
+    
+    switch (type) {
+        case VECTOR_TYPE_F32: quantize_float32((const float *)v1, v, offset, scale, dimension, qtype); break;
+        case VECTOR_TYPE_F16: quantize_float16((const uint16_t *)v1, v, offset, scale, dimension, qtype); break;
+        case VECTOR_TYPE_BF16: quantize_bfloat16((const uint16_t *)v1, v, offset, scale, dimension, qtype); break;
+        case VECTOR_TYPE_U8: quantize_u8((const uint8_t *)v1, v, offset, scale, dimension, qtype); break;
+        case VECTOR_TYPE_I8: quantize_i8((const int8_t *)v1, v, offset, scale, dimension, qtype); break;
     }
+    
     if (c->table->preloaded) {
         int rc = vQuantRunMemory(c, v, qtype, dimension);
         if (v) sqlite3_free(v);
         return rc;
     }
+    VECTOR_PRINT((void*)v, (qtype == VECTOR_QUANT_U8BIT) ? VECTOR_TYPE_U8 : VECTOR_TYPE_I8, dimension);
     
     char sql[STATIC_SQL_SIZE];
     generate_select_quant_table(c->table->t_name, c->table->c_name, sql);
@@ -1789,7 +2076,9 @@ static int vQuantRun (sqlite3 *db, vFullScanCursor *c, const void *v1, int v1siz
         for (int i=0; i<counter; ++i) {
             const uint8_t *current_data = data + (i * total_stride);
             const uint8_t *vector_data = current_data + rowid_size;
-            double distance = (double)distance_fn((const void *)v, (const void *)vector_data, dimension);
+            float distance = distance_fn((const void *)v, (const void *)vector_data, dimension);
+            if (nearly_zero_float32(distance)) distance = 0.0;
+            VECTOR_PRINT((void*)vector_data, vt, dimension);
             
             if (distance < current_max_distance) {
                 c->distance[c->max_index] = distance;
@@ -1982,7 +2271,7 @@ SQLITE_VECTOR_API int sqlite3_vector_init (sqlite3 *db, char **pzErrMsg, const s
     if (rc != SQLITE_OK) goto cleanup;
     
     // table_name, column_name
-    rc = sqlite3_create_function(db, "vector_cleanup", 2, SQLITE_UTF8, ctx, vector_cleanup, NULL, NULL);
+    rc = sqlite3_create_function(db, "vector_quantize_cleanup", 2, SQLITE_UTF8, ctx, vector_quantize_cleanup, NULL, NULL);
     if (rc != SQLITE_OK) goto cleanup;
     
     rc = sqlite3_create_function(db, "vector_as_f32", 1, SQLITE_UTF8, ctx, vector_as_f32, NULL, NULL);
